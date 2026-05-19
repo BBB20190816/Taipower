@@ -40,9 +40,10 @@ importer_supplement.py — 補充欄位 Excel 匯入（auto/manual 兩種模式�
 
 **JSONB 查詢語法：**
 ```sql
-core_fields->>'mainTitle 文物名稱'             -- 取文字值（含空格的 key 直接寫）
-core_fields->>'conditions 保存狀況' IS NOT NULL
+core_fields->>'mainTitle'             -- JSONB key 只有英文代碼（Excel Row1 取第一行 \n 之前的部分）
+core_fields->>'conditions' IS NOT NULL
 ```
+常用欄位對照：`mainTitle`、`dataType`、`subType`、`conditions`、`energyType`、`abstract`、`significance`、`keywords`、`material`、`dateNameYearStart`
 
 **連線介面（`_ConnWrapper`）：**
 `db.get_conn()` 回傳 `_ConnWrapper`，介面與 sqlite3 相同：
