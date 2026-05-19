@@ -54,6 +54,12 @@ class _ConnWrapper:
         cur.execute(sql, params if params else None)
         return cur
 
+    def executemany(self, sql: str, params_list):
+        sql = sql.replace("?", "%s")
+        cur = self._conn.cursor()
+        psycopg2.extras.execute_batch(cur, sql, params_list, page_size=500)
+        return cur
+
     def commit(self):
         self._conn.commit()
 

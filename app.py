@@ -128,50 +128,57 @@ elif page == "📥 主清單匯入":
     st.title("📥 主清單匯入")
     st.caption("上傳 metadata Excel 檔案，自動解析欄位並寫入資料庫。")
 
-    uploaded = st.file_uploader("選擇 Excel 檔案（.xlsx）", type=["xlsx"])
+    uploaded_files = st.file_uploader(
+        "選擇 Excel 檔案（.xlsx，可多選）", type=["xlsx"], accept_multiple_files=True
+    )
 
-    if uploaded:
-        # 暫存到本地
-        tmp_path = Path("data") / "tmp_main.xlsx"
-        tmp_path.parent.mkdir(exist_ok=True)
-        tmp_path.write_bytes(uploaded.read())
+    if uploaded_files:
+        # 逐檔預覽
+        tmp_dir = Path("data")
+        tmp_dir.mkdir(exist_ok=True)
 
-        # 預覽
-        with st.spinner("讀取檔案中..."):
-            preview = preview_import(str(tmp_path))
+        previews = []
+        for uf in uploaded_files:
+            tmp_path = tmp_dir / f"tmp_{uf.name}"
+            tmp_path.write_bytes(uf.read())
+            with st.spinner(f"讀取 {uf.name}..."):
+                p = preview_import(str(tmp_path))
+            p["_tmp_path"] = str(tmp_path)
+            p["_filename"] = uf.name
+            previews.append(p)
 
-        st.subheader("匯入預覽")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("偵測工作表", preview["sheet"])
-        col2.metric("文物筆數", preview["total"])
-        col3.metric("欄位數", preview["columns_found"])
+        # 顯示各檔摘要表
+        st.subheader(f"共選取 {len(previews)} 個檔案")
+        summary_rows = []
+        for p in previews:
+            warns = "；".join(p["warnings"]) if p["warnings"] else "—"
+            summary_rows.append({
+                "檔案名稱": p["_filename"],
+                "工作表": p["sheet"],
+                "文物筆數": p["total"],
+                "欄位數": p["columns_found"],
+                "警告": warns,
+            })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        if preview["warnings"]:
-            for w in preview["warnings"]:
-                st.warning(w)
-
-        # 空白率
-        if preview["null_rates"]:
-            st.subheader("核心欄位填寫率")
-            nr_df = pd.DataFrame([
-                {"欄位": k, "空白筆數": v["null"], "空白率": f"{v['pct']}%"}
-                for k, v in preview["null_rates"].items()
-            ])
-            st.dataframe(nr_df, use_container_width=True, hide_index=True)
-
-        # 樣本資料
-        st.subheader("前5筆資料預覽")
-        st.dataframe(pd.DataFrame(preview["sample_rows"]), use_container_width=True, hide_index=True)
+        # 展開各檔詳細預覽
+        for p in previews:
+            with st.expander(f"📄 {p['_filename']} — 前5筆預覽"):
+                if p["warnings"]:
+                    for w in p["warnings"]:
+                        st.warning(w)
+                st.dataframe(pd.DataFrame(p["sample_rows"]), use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("匯入設定")
 
         col_a, col_b = st.columns(2)
         with col_a:
+            default_label = previews[0]["_filename"].replace(".xlsx", "") if len(previews) == 1 else ""
             batch_label = st.text_input(
                 "批次標籤（用於識別這次匯入來源）",
-                value=uploaded.name.replace(".xlsx", ""),
-                help="例如：113年第5期審查"
+                value=default_label,
+                help="例如：113年第5期審查",
             )
         with col_b:
             on_dup = st.selectbox(
@@ -181,23 +188,28 @@ elif page == "📥 主清單匯入":
             )
 
         if st.button("✅ 確認匯入", type="primary", disabled=not batch_label):
-            bar = st.progress(0, text="準備中...")
+            total_inserted = total_updated = total_skipped = 0
+            for i, p in enumerate(previews):
+                st.caption(f"正在匯入第 {i+1}/{len(previews)} 個檔案：{p['_filename']}")
+                bar = st.progress(0, text="準備中...")
 
-            def cb(cur, tot, msg):
-                bar.progress(cur / tot, text=msg)
+                def cb(cur, tot, msg, _bar=bar):
+                    _bar.progress(cur / tot, text=msg)
 
-            with st.spinner("匯入中..."):
-                result = run_import(str(tmp_path), batch_label, on_dup, cb)
+                result = run_import(p["_tmp_path"], batch_label, on_dup, cb)
+                bar.progress(1.0, text="完成！")
 
-            bar.progress(1.0, text="完成！")
+                if result["success"]:
+                    total_inserted += result["inserted"]
+                    total_updated  += result["updated"]
+                    total_skipped  += result["skipped"]
+                else:
+                    st.error(f"{p['_filename']} 匯入失敗：{result.get('error')}")
 
-            if result["success"]:
-                st.success(
-                    f"匯入完成！新增 {result['inserted']} 筆、"
-                    f"更新 {result['updated']} 筆、跳過 {result['skipped']} 筆"
-                )
-            else:
-                st.error(f"匯入失敗：{result.get('error')}")
+            st.success(
+                f"全部匯入完成！共新增 {total_inserted} 筆、"
+                f"更新 {total_updated} 筆、跳過 {total_skipped} 筆"
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════

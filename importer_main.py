@@ -135,13 +135,11 @@ def run_import(
     progress_callback=None,
 ) -> dict:
     """
-    執行主清單匯入。
+    執行主清單匯入（批次寫入，大幅減少 DB round-trip）。
 
     on_duplicate:
         'skip'      — 遇到已存在的 metadataID 跳過
         'overwrite' — 遇到已存在的 metadataID 更新欄位值
-
-    progress_callback: 可選，接受 (current, total, message) 的函式，供 Streamlit progress bar 使用
     """
     xl = pd.ExcelFile(file_path)
     sheet = _find_metadata_sheet(xl)
@@ -164,78 +162,94 @@ def run_import(
 
     conn = get_conn()
     now = datetime.now().isoformat()
+
+    # 一次撈出所有既有 ID，避免逐列查詢
+    existing_ids = set(
+        r[0] for r in conn.execute("SELECT metadata_id FROM artifacts").fetchall()
+    )
+
+    to_insert = []       # (metadata_id, batch_label, now, Json(core))
+    to_update = []       # (Json(core), batch_label, now, metadata_id)
+    overwrite_ids = []   # 需要清除舊 tags 的 ID
+    all_tags = []        # (metadata_id, field_code, tag)
+    all_fts = []         # (metadata_id, search_text)
     inserted = updated = skipped = 0
     total = len(df_valid)
 
+    # ── Phase 1：解析 Excel，在 Python 層整理好所有資料 ──────────────────
     for idx, row in df_valid.iterrows():
         if progress_callback:
-            progress_callback(idx + 1, total, f"匯入第 {idx+1}/{total} 筆")
+            progress_callback(idx + 1, total, f"解析第 {idx+1}/{total} 筆...")
 
         metadata_id = str(row[mid_col]).strip()
         if not metadata_id or metadata_id == "nan":
             skipped += 1
             continue
 
-        # 將整列轉為 dict（排除私有欄位）
         core = {
             k: (None if pd.isna(v) else str(v).strip())
             for k, v in row.items()
             if not k.startswith("_")
         }
 
-        # 檢查是否已存在
-        existing = conn.execute(
-            "SELECT id FROM artifacts WHERE metadata_id = ?", (metadata_id,)
-        ).fetchone()
-
-        if existing:
+        if metadata_id in existing_ids:
             if on_duplicate == "overwrite":
-                conn.execute(
-                    "UPDATE artifacts SET core_fields=?, batch_label=?, imported_at=? WHERE metadata_id=?",
-                    (psycopg2.extras.Json(core), batch_label, now, metadata_id)
-                )
-                # 清除舊標籤
-                conn.execute("DELETE FROM tags WHERE metadata_id=?", (metadata_id,))
+                to_update.append((psycopg2.extras.Json(core), batch_label, now, metadata_id))
+                overwrite_ids.append(metadata_id)
                 updated += 1
             else:
                 skipped += 1
                 continue
         else:
-            conn.execute(
-                "INSERT INTO artifacts (metadata_id, batch_label, imported_at, core_fields) VALUES (?,?,?,?)",
-                (metadata_id, batch_label, now, psycopg2.extras.Json(core))
-            )
+            to_insert.append((metadata_id, batch_label, now, psycopg2.extras.Json(core)))
             inserted += 1
 
-        # 寫入標籤索引
+        # 收集 tags
         for field_prefix in TAG_SPLIT_FIELDS:
             tag_col = next((c for c in df_valid.columns if c.startswith(field_prefix)), None)
             if tag_col and pd.notna(row.get(tag_col)):
-                tags = _split_tags(str(row[tag_col]), field_prefix)
-                for tag in tags:
-                    conn.execute(
-                        "INSERT INTO tags (metadata_id, field_code, tag) VALUES (?,?,?)",
-                        (metadata_id, field_prefix, tag)
-                    )
+                for tag in _split_tags(str(row[tag_col]), field_prefix):
+                    all_tags.append((metadata_id, field_prefix, tag))
 
-        # 更新 FTS 索引（tsvector UPSERT）
+        # 收集 FTS 文字
         fts_parts = []
-        for fts_col, field_prefix in FTS_FIELD_MAP.items():
+        for _, field_prefix in FTS_FIELD_MAP.items():
             src = next((c for c in df_valid.columns if c.startswith(field_prefix)), None)
             fts_parts.append(str(row[src]).strip() if src and pd.notna(row.get(src)) else "")
-        search_text = " ".join(filter(None, fts_parts))
+        all_fts.append((metadata_id, " ".join(filter(None, fts_parts))))
 
-        conn.execute(
+    # ── Phase 2：批次寫入（幾次 round-trip 完成所有操作）────────────────
+    if progress_callback:
+        progress_callback(total, total, "寫入資料庫中...")
+
+    if to_insert:
+        conn.executemany(
+            "INSERT INTO artifacts (metadata_id, batch_label, imported_at, core_fields) VALUES (?,?,?,?)",
+            to_insert,
+        )
+    if overwrite_ids:
+        conn.executemany("DELETE FROM tags WHERE metadata_id=?", [(i,) for i in overwrite_ids])
+    if to_update:
+        conn.executemany(
+            "UPDATE artifacts SET core_fields=?, batch_label=?, imported_at=? WHERE metadata_id=?",
+            to_update,
+        )
+    if all_tags:
+        conn.executemany(
+            "INSERT INTO tags (metadata_id, field_code, tag) VALUES (?,?,?)",
+            all_tags,
+        )
+    if all_fts:
+        conn.executemany(
             """INSERT INTO artifacts_fts(metadata_id, search_vector)
                VALUES(?, to_tsvector('simple', ?))
                ON CONFLICT(metadata_id) DO UPDATE
                SET search_vector = EXCLUDED.search_vector""",
-            (metadata_id, search_text)
+            all_fts,
         )
 
     conn.commit()
 
-    # 寫入匯入紀錄
     conn.execute(
         """INSERT INTO import_log
            (import_type, batch_label, filename, imported_at, total_rows, inserted, updated, skipped, unmatched)
