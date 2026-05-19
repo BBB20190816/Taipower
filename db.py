@@ -15,6 +15,7 @@ def _get_conn_kwargs() -> dict:
     1. 單一 URL：secrets["DATABASE_URL"] 或環境變數 DATABASE_URL
     2. 個別參數：secrets["DB_HOST"] / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
        （密碼含特殊字元時建議用此方式，不需 URL encode）
+    Supabase 強制 SSL，固定帶入 sslmode=require。
     """
     try:
         import streamlit as st
@@ -26,8 +27,12 @@ def _get_conn_kwargs() -> dict:
                 "dbname":   s.get("DB_NAME", "postgres"),
                 "user":     s.get("DB_USER", "postgres"),
                 "password": s["DB_PASSWORD"],
+                "sslmode":  "require",
             }
-        return {"dsn": s["DATABASE_URL"]}
+        url = str(s["DATABASE_URL"])
+        if "sslmode" not in url:
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        return {"dsn": url}
     except Exception:
         url = os.environ.get("DATABASE_URL", "")
         return {"dsn": url} if url else {}

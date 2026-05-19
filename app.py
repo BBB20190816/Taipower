@@ -17,7 +17,15 @@ from importer_supplement import (
 )
 
 # ── 初始化 ──────────────────────────────────────────────────────────────────
-init_db()
+try:
+    init_db()
+except Exception as _db_err:
+    st.error(
+        f"**資料庫連線失敗**：{type(_db_err).__name__}: {_db_err}\n\n"
+        "請確認 Streamlit Secrets 已正確設定 `DB_HOST` / `DB_PASSWORD`，"
+        "或 `DATABASE_URL`（需含 `?sslmode=require`）。"
+    )
+    st.stop()
 
 st.set_page_config(
     page_title="電業文物清單研究分析工具",
