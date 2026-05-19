@@ -1,68 +1,91 @@
 """
 db.py — 資料庫初始化與共用查詢工具
-使用 SQLite，包含主資料表、標籤索引表、欄位定義表、補充欄位表、匯入紀錄表
+使用 PostgreSQL (Supabase)
+連線字串從 Streamlit secrets["DATABASE_URL"] 或環境變數 DATABASE_URL 讀取
 """
-import sqlite3
 import os
-from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "data" / "artifacts.db"
+import psycopg2
+import psycopg2.extras
 
 
-def get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def _get_url() -> str:
+    try:
+        import streamlit as st
+        return st.secrets["DATABASE_URL"]
+    except Exception:
+        return os.environ.get("DATABASE_URL", "")
+
+
+class _ConnWrapper:
+    """
+    讓 psycopg2 connection 的介面與原本 sqlite3 一致。
+    - execute() 自動將 ? 轉為 %s（psycopg2 的佔位符）
+    - 每次 execute() 建立新 cursor，回傳 cursor（可呼叫 .fetchone() / .fetchall()）
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params=()):
+        sql = sql.replace("?", "%s")
+        cur = self._conn.cursor()
+        cur.execute(sql, params if params else None)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def get_conn() -> _ConnWrapper:
+    conn = psycopg2.connect(_get_url())
+    return _ConnWrapper(conn)
 
 
 def init_db():
     """建立所有資料表（若不存在）"""
-    conn = get_conn()
-    cur = conn.cursor()
+    raw = psycopg2.connect(_get_url())
+    cur = raw.cursor()
 
-    # ── 主資料表：每筆文物一列，欄位以 JSON 儲存動態欄位 ──────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS artifacts (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            metadata_id   TEXT    NOT NULL UNIQUE,   -- metadataID，主鍵
-            batch_label   TEXT    NOT NULL,           -- 來源批次標籤
-            imported_at   TEXT    NOT NULL,           -- 匯入時間 ISO8601
-            core_fields   TEXT    NOT NULL            -- JSON：所有欄位值
+            id            SERIAL PRIMARY KEY,
+            metadata_id   TEXT   NOT NULL UNIQUE,
+            batch_label   TEXT   NOT NULL,
+            imported_at   TEXT   NOT NULL,
+            core_fields   JSONB  NOT NULL
         )
     """)
 
-    # ── 標籤索引表：keywords / subjectMatter 拆分後的獨立標籤 ──────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tags (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             metadata_id TEXT NOT NULL REFERENCES artifacts(metadata_id) ON DELETE CASCADE,
-            field_code  TEXT NOT NULL,   -- 來源欄位，如 keywords
+            field_code  TEXT NOT NULL,
             tag         TEXT NOT NULL
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tags_mid ON tags(metadata_id)")
 
-    # ── 補充欄位表：每次「補充欄位匯入」新增的自訂欄位值 ────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS supplement_fields (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            id            SERIAL PRIMARY KEY,
             metadata_id   TEXT NOT NULL REFERENCES artifacts(metadata_id) ON DELETE CASCADE,
-            field_code    TEXT NOT NULL,   -- 補充欄位代碼（使用者自訂）
-            field_label   TEXT NOT NULL,   -- 補充欄位中文名稱
-            field_value   TEXT,            -- 欄位值
-            batch_label   TEXT NOT NULL,   -- 來源批次標籤
+            field_code    TEXT NOT NULL,
+            field_label   TEXT NOT NULL,
+            field_value   TEXT,
+            batch_label   TEXT NOT NULL,
             imported_at   TEXT NOT NULL,
-            UNIQUE(metadata_id, field_code)  -- 同欄位同筆資料只能有一個值
+            UNIQUE(metadata_id, field_code)
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_supp_mid ON supplement_fields(metadata_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_supp_mid   ON supplement_fields(metadata_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_supp_field ON supplement_fields(field_code)")
 
-    # ── 欄位定義表：記錄所有出現過的補充欄位 ────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS supplement_field_defs (
             field_code  TEXT PRIMARY KEY,
@@ -71,11 +94,10 @@ def init_db():
         )
     """)
 
-    # ── 匯入紀錄表 ────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS import_log (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            import_type  TEXT NOT NULL,   -- 'main' | 'supplement'
+            id           SERIAL PRIMARY KEY,
+            import_type  TEXT NOT NULL,
             batch_label  TEXT NOT NULL,
             filename     TEXT NOT NULL,
             imported_at  TEXT NOT NULL,
@@ -88,32 +110,30 @@ def init_db():
         )
     """)
 
-    # ── 全文搜尋虛擬表（FTS5）────────────────────────────────────────────
+    # 全文搜尋表（PostgreSQL tsvector）
     cur.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
-            metadata_id UNINDEXED,
-            main_title,
-            abstract,
-            significance,
-            keywords_raw,
-            content='',
-            tokenize='unicode61'
+        CREATE TABLE IF NOT EXISTS artifacts_fts (
+            metadata_id   TEXT PRIMARY KEY
+                REFERENCES artifacts(metadata_id) ON DELETE CASCADE,
+            search_vector TSVECTOR
         )
     """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fts_vector ON artifacts_fts USING GIN(search_vector)"
+    )
 
-    # ── 篩選快照表 ────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS saved_filters (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             name        TEXT NOT NULL UNIQUE,
             filter_json TEXT NOT NULL,
             created_at  TEXT NOT NULL
         )
     """)
 
-    conn.commit()
-    conn.close()
-    print(f"[db] 資料庫初始化完成：{DB_PATH}")
+    raw.commit()
+    raw.close()
+    print("[db] PostgreSQL 資料庫初始化完成")
 
 
 if __name__ == "__main__":

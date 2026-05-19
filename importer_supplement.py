@@ -243,4 +243,4 @@ def get_supplement_field_defs() -> list[dict]:
         "SELECT field_code, field_label, created_at FROM supplement_field_defs ORDER BY created_at"
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [{"field_code": r[0], "field_label": r[1], "created_at": r[2]} for r in rows]

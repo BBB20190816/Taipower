@@ -12,11 +12,10 @@ importer_main.py — 主清單（metadata Excel）匯入邏輯
 8. 回傳匯入報告 dict
 """
 import json
-import sqlite3
 from datetime import datetime
-from typing import Optional
 
 import pandas as pd
+import psycopg2.extras
 
 from db import get_conn
 
@@ -177,13 +176,12 @@ def run_import(
             skipped += 1
             continue
 
-        # 將整列轉為 JSON（排除私有欄位）
+        # 將整列轉為 dict（排除私有欄位）
         core = {
             k: (None if pd.isna(v) else str(v).strip())
             for k, v in row.items()
             if not k.startswith("_")
         }
-        core_json = json.dumps(core, ensure_ascii=False)
 
         # 檢查是否已存在
         existing = conn.execute(
@@ -194,7 +192,7 @@ def run_import(
             if on_duplicate == "overwrite":
                 conn.execute(
                     "UPDATE artifacts SET core_fields=?, batch_label=?, imported_at=? WHERE metadata_id=?",
-                    (core_json, batch_label, now, metadata_id)
+                    (psycopg2.extras.Json(core), batch_label, now, metadata_id)
                 )
                 # 清除舊標籤
                 conn.execute("DELETE FROM tags WHERE metadata_id=?", (metadata_id,))
@@ -205,7 +203,7 @@ def run_import(
         else:
             conn.execute(
                 "INSERT INTO artifacts (metadata_id, batch_label, imported_at, core_fields) VALUES (?,?,?,?)",
-                (metadata_id, batch_label, now, core_json)
+                (metadata_id, batch_label, now, psycopg2.extras.Json(core))
             )
             inserted += 1
 
@@ -220,18 +218,19 @@ def run_import(
                         (metadata_id, field_prefix, tag)
                     )
 
-        # 更新 FTS 索引
-        fts_values = {"metadata_id": metadata_id}
+        # 更新 FTS 索引（tsvector UPSERT）
+        fts_parts = []
         for fts_col, field_prefix in FTS_FIELD_MAP.items():
             src = next((c for c in df_valid.columns if c.startswith(field_prefix)), None)
-            fts_values[fts_col] = str(row[src]).strip() if src and pd.notna(row.get(src)) else ""
+            fts_parts.append(str(row[src]).strip() if src and pd.notna(row.get(src)) else "")
+        search_text = " ".join(filter(None, fts_parts))
 
-        # 刪除舊 FTS 記錄再插入（FTS5 content='' 需手動維護）
-        conn.execute("DELETE FROM artifacts_fts WHERE metadata_id=?", (metadata_id,))
         conn.execute(
-            "INSERT INTO artifacts_fts(metadata_id, main_title, abstract, significance, keywords_raw) VALUES(?,?,?,?,?)",
-            (metadata_id, fts_values["main_title"], fts_values["abstract"],
-             fts_values["significance"], fts_values["keywords_raw"])
+            """INSERT INTO artifacts_fts(metadata_id, search_vector)
+               VALUES(?, to_tsvector('simple', ?))
+               ON CONFLICT(metadata_id) DO UPDATE
+               SET search_vector = EXCLUDED.search_vector""",
+            (metadata_id, search_text)
         )
 
     conn.commit()
@@ -269,10 +268,9 @@ def update_artifact(
     conn = get_conn()
     now = datetime.now().isoformat()
 
-    core_json = json.dumps(core_fields, ensure_ascii=False)
     conn.execute(
         "UPDATE artifacts SET core_fields=?, imported_at=? WHERE metadata_id=?",
-        (core_json, now, metadata_id),
+        (psycopg2.extras.Json(core_fields), now, metadata_id),
     )
 
     # 重建 tags（keywords / subjectMatter / placeName）
@@ -286,17 +284,19 @@ def update_artifact(
                     (metadata_id, field_prefix, tag),
                 )
 
-    # 重建 FTS 索引
-    fts_vals = {}
+    # 重建 FTS 索引（tsvector UPSERT）
+    fts_parts = []
     for fts_col, field_prefix in FTS_FIELD_MAP.items():
         src = next((k for k in core_fields if k.startswith(field_prefix)), None)
-        fts_vals[fts_col] = str(core_fields[src]).strip() if src and core_fields.get(src) else ""
+        fts_parts.append(str(core_fields[src]).strip() if src and core_fields.get(src) else "")
+    search_text = " ".join(filter(None, fts_parts))
 
-    conn.execute("DELETE FROM artifacts_fts WHERE metadata_id=?", (metadata_id,))
     conn.execute(
-        "INSERT INTO artifacts_fts(metadata_id, main_title, abstract, significance, keywords_raw) VALUES(?,?,?,?,?)",
-        (metadata_id, fts_vals.get("main_title", ""), fts_vals.get("abstract", ""),
-         fts_vals.get("significance", ""), fts_vals.get("keywords_raw", "")),
+        """INSERT INTO artifacts_fts(metadata_id, search_vector)
+           VALUES(?, to_tsvector('simple', ?))
+           ON CONFLICT(metadata_id) DO UPDATE
+           SET search_vector = EXCLUDED.search_vector""",
+        (metadata_id, search_text),
     )
 
     # 更新補充欄位

@@ -4,7 +4,6 @@ app.py — 電業文物清單研究分析工具
 """
 import json
 import io
-import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -67,7 +66,7 @@ if page == "🏠 總覽":
         col1, col2, col3, col4 = st.columns(4)
 
         cond_counts = dict(conn.execute(
-            """SELECT json_extract(core_fields,'$.\"conditions 保存狀況\"'), COUNT(*)
+            """SELECT core_fields->>'conditions 保存狀況', COUNT(*)
                FROM artifacts GROUP BY 1"""
         ).fetchall())
 
@@ -353,19 +352,19 @@ elif page == "🔍 搜尋與篩選":
 
         # 保存狀況
         cond_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"conditions 保存狀況\"') FROM artifacts WHERE json_extract(core_fields,'$.\"conditions 保存狀況\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'conditions 保存狀況' FROM artifacts WHERE core_fields->>'conditions 保存狀況' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_cond = st.multiselect("保存狀況", cond_vals)
 
         # 典藏類型
         dtype_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"dataType 典藏類型\"') FROM artifacts WHERE json_extract(core_fields,'$.\"dataType 典藏類型\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'dataType 典藏類型' FROM artifacts WHERE core_fields->>'dataType 典藏類型' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_dtype = st.multiselect("典藏類型", dtype_vals)
 
         # 系統別
         energy_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"energyType 系統別\"') FROM artifacts WHERE json_extract(core_fields,'$.\"energyType 系統別\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'energyType 系統別' FROM artifacts WHERE core_fields->>'energyType 系統別' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_energy = st.multiselect("系統別", energy_vals)
 
@@ -404,19 +403,19 @@ elif page == "🔍 搜尋與篩選":
     params = []
 
     if search_query.strip():
-        # FTS 搜尋
+        # FTS 搜尋（tsvector）
         fts_ids = [r[0] for r in conn.execute(
-            "SELECT metadata_id FROM artifacts_fts WHERE artifacts_fts MATCH ? ORDER BY rank",
-            (f'"{search_query}"',)
+            "SELECT metadata_id FROM artifacts_fts WHERE search_vector @@ plainto_tsquery('simple', ?)",
+            (search_query,)
         ).fetchall()]
         if not fts_ids:
-            # fallback: LIKE 搜尋
+            # fallback: ILIKE 搜尋（中文友善）
             like = f"%{search_query}%"
             fts_ids = [r[0] for r in conn.execute(
                 """SELECT metadata_id FROM artifacts WHERE
-                   json_extract(core_fields,'$.\"mainTitle 文物名稱\"') LIKE ? OR
-                   json_extract(core_fields,'$.\"abstract 文物綜合簡述\"') LIKE ? OR
-                   json_extract(core_fields,'$.\"significance 文化意義\"') LIKE ?""",
+                   core_fields->>'mainTitle 文物名稱' ILIKE ? OR
+                   core_fields->>'abstract 文物綜合簡述' ILIKE ? OR
+                   core_fields->>'significance 文化意義' ILIKE ?""",
                 (like, like, like)
             ).fetchall()]
         if fts_ids:
@@ -424,21 +423,21 @@ elif page == "🔍 搜尋與篩選":
             where_clauses.append(f"a.metadata_id IN ({placeholders})")
             params.extend(fts_ids)
         else:
-            where_clauses.append("1=0")  # 搜尋結果為空
+            where_clauses.append("1=0")
 
     if sel_cond:
         ph = ",".join("?" * len(sel_cond))
-        where_clauses.append(f"json_extract(a.core_fields,'$.\"conditions 保存狀況\"') IN ({ph})")
+        where_clauses.append(f"a.core_fields->>'conditions 保存狀況' IN ({ph})")
         params.extend(sel_cond)
 
     if sel_dtype:
         ph = ",".join("?" * len(sel_dtype))
-        where_clauses.append(f"json_extract(a.core_fields,'$.\"dataType 典藏類型\"') IN ({ph})")
+        where_clauses.append(f"a.core_fields->>'dataType 典藏類型' IN ({ph})")
         params.extend(sel_dtype)
 
     if sel_energy:
         ph = ",".join("?" * len(sel_energy))
-        where_clauses.append(f"json_extract(a.core_fields,'$.\"energyType 系統別\"') IN ({ph})")
+        where_clauses.append(f"a.core_fields->>'energyType 系統別' IN ({ph})")
         params.extend(sel_energy)
 
     if sel_tags:
@@ -472,12 +471,12 @@ elif page == "🔍 搜尋與篩選":
 
     data_sql = f"""
         SELECT a.metadata_id,
-               json_extract(a.core_fields,'$.\"mainTitle 文物名稱\"') as 文物名稱,
-               json_extract(a.core_fields,'$.\"dataType 典藏類型\"') as 典藏類型,
-               json_extract(a.core_fields,'$.\"conditions 保存狀況\"') as 保存狀況,
-               json_extract(a.core_fields,'$.\"keywords+ 關鍵詞\"') as 關鍵詞,
-               substr(json_extract(a.core_fields,'$.\"abstract 文物綜合簡述\"'),1,80) as 簡述,
-               a.batch_label as 來源批次
+               a.core_fields->>'mainTitle 文物名稱' AS 文物名稱,
+               a.core_fields->>'dataType 典藏類型'  AS 典藏類型,
+               a.core_fields->>'conditions 保存狀況' AS 保存狀況,
+               a.core_fields->>'keywords+ 關鍵詞'   AS 關鍵詞,
+               LEFT(a.core_fields->>'abstract 文物綜合簡述', 80) AS 簡述,
+               a.batch_label AS 來源批次
         FROM artifacts a {where_sql}
         LIMIT 200
     """
@@ -502,7 +501,7 @@ elif page == "🔍 搜尋與篩選":
         if selected_id and selected_id != "（不選）":
             row = conn.execute("SELECT core_fields FROM artifacts WHERE metadata_id=?", (selected_id,)).fetchone()
             if row:
-                core = json.loads(row[0])
+                core = row[0]  # psycopg2 自動將 JSONB 反序列化為 dict
                 supp_rows = conn.execute(
                     "SELECT field_code, field_label, field_value FROM supplement_fields WHERE metadata_id=?",
                     (selected_id,)
@@ -584,11 +583,11 @@ elif page == "📊 交叉分析":
     supp_defs = {d["field_code"]: d["field_label"] for d in get_supplement_field_defs()}
 
     PIVOT_FIELDS = {
-        "典藏類型":  "json_extract(core_fields,'$.\"dataType 典藏類型\"')",
-        "典藏次類型": "json_extract(core_fields,'$.\"subType 典藏次類型\"')",
-        "保存狀況":  "json_extract(core_fields,'$.\"conditions 保存狀況\"')",
-        "系統別":   "json_extract(core_fields,'$.\"energyType 系統別\"')",
-        "主要材質":  "json_extract(core_fields,'$.\"material 主要材質\"')",
+        "典藏類型":  "core_fields->>'dataType 典藏類型'",
+        "典藏次類型": "core_fields->>'subType 典藏次類型'",
+        "保存狀況":  "core_fields->>'conditions 保存狀況'",
+        "系統別":   "core_fields->>'energyType 系統別'",
+        "主要材質":  "core_fields->>'material 主要材質'",
         "來源批次":  "batch_label",
     }
     # 加入補充欄位
@@ -660,16 +659,16 @@ elif page == "📤 匯出":
 
     EXPORT_COLS = {
         "metadataID（詮釋資料識別碼）": "metadata_id",
-        "文物名稱":   "json_extract(core_fields,'$.\"mainTitle 文物名稱\"')",
-        "典藏類型":   "json_extract(core_fields,'$.\"dataType 典藏類型\"')",
-        "典藏次類型": "json_extract(core_fields,'$.\"subType 典藏次類型\"')",
-        "保存狀況":   "json_extract(core_fields,'$.\"conditions 保存狀況\"')",
-        "文物綜合簡述": "json_extract(core_fields,'$.\"abstract 文物綜合簡述\"')",
-        "文化意義":   "json_extract(core_fields,'$.\"significance 文化意義\"')",
-        "關鍵詞":    "json_extract(core_fields,'$.\"keywords+ 關鍵詞\"')",
-        "主要材質":  "json_extract(core_fields,'$.\"material 主要材質\"')",
-        "起始西元年": "json_extract(core_fields,'$.\"dateNameYearStart 起始西元年\"')",
-        "系統別":    "json_extract(core_fields,'$.\"energyType 系統別\"')",
+        "文物名稱":   "core_fields->>'mainTitle 文物名稱'",
+        "典藏類型":   "core_fields->>'dataType 典藏類型'",
+        "典藏次類型": "core_fields->>'subType 典藏次類型'",
+        "保存狀況":   "core_fields->>'conditions 保存狀況'",
+        "文物綜合簡述": "core_fields->>'abstract 文物綜合簡述'",
+        "文化意義":   "core_fields->>'significance 文化意義'",
+        "關鍵詞":    "core_fields->>'keywords+ 關鍵詞'",
+        "主要材質":  "core_fields->>'material 主要材質'",
+        "起始西元年": "core_fields->>'dateNameYearStart 起始西元年'",
+        "系統別":    "core_fields->>'energyType 系統別'",
         "來源批次":  "batch_label",
     }
 
@@ -678,17 +677,17 @@ elif page == "📤 匯出":
         st.subheader("篩選條件")
 
         cond_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"conditions 保存狀況\"') FROM artifacts WHERE json_extract(core_fields,'$.\"conditions 保存狀況\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'conditions 保存狀況' FROM artifacts WHERE core_fields->>'conditions 保存狀況' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_cond = st.multiselect("保存狀況", cond_vals, key="exp_cond")
 
         dtype_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"dataType 典藏類型\"') FROM artifacts WHERE json_extract(core_fields,'$.\"dataType 典藏類型\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'dataType 典藏類型' FROM artifacts WHERE core_fields->>'dataType 典藏類型' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_dtype = st.multiselect("典藏類型", dtype_vals, key="exp_dtype")
 
         energy_vals = [r[0] for r in conn.execute(
-            "SELECT DISTINCT json_extract(core_fields,'$.\"energyType 系統別\"') FROM artifacts WHERE json_extract(core_fields,'$.\"energyType 系統別\"') IS NOT NULL ORDER BY 1"
+            "SELECT DISTINCT core_fields->>'energyType 系統別' FROM artifacts WHERE core_fields->>'energyType 系統別' IS NOT NULL ORDER BY 1"
         ).fetchall()]
         sel_energy = st.multiselect("系統別", energy_vals, key="exp_energy")
 
@@ -703,15 +702,15 @@ elif page == "📤 匯出":
 
     if sel_cond:
         ph = ",".join("?" * len(sel_cond))
-        where_clauses.append(f"json_extract(core_fields,'$.\"conditions 保存狀況\"') IN ({ph})")
+        where_clauses.append(f"core_fields->>'conditions 保存狀況' IN ({ph})")
         params.extend(sel_cond)
     if sel_dtype:
         ph = ",".join("?" * len(sel_dtype))
-        where_clauses.append(f"json_extract(core_fields,'$.\"dataType 典藏類型\"') IN ({ph})")
+        where_clauses.append(f"core_fields->>'dataType 典藏類型' IN ({ph})")
         params.extend(sel_dtype)
     if sel_energy:
         ph = ",".join("?" * len(sel_energy))
-        where_clauses.append(f"json_extract(core_fields,'$.\"energyType 系統別\"') IN ({ph})")
+        where_clauses.append(f"core_fields->>'energyType 系統別' IN ({ph})")
         params.extend(sel_energy)
     if sel_batch:
         ph = ",".join("?" * len(sel_batch))

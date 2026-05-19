@@ -32,7 +32,7 @@ data/artifacts.db      — SQLite 資料庫（執行後產生）
 - **`artifacts_fts`**：FTS5 虛擬表，content='' 需手動維護（`importer_main.py` 負責）
 - **`import_log`**：所有匯入歷程記錄
 
-SQLite JSON 查詢語法：`json_extract(core_fields, '$.\"mainTitle 文物名稱\"')`
+PostgreSQL JSONB 查詢語法：`core_fields->>'mainTitle 文物名稱'`（欄位名稱含空格直接寫，不需跳脫）
 
 ## Excel 格式規範（主清單）
 
