@@ -71,6 +71,13 @@ if page == "🏠 總覽":
     if total == 0:
         st.info("資料庫目前沒有資料。請先到「主清單匯入」上傳 Excel 清單。")
     else:
+        # ── 暫時 debug：顯示第一筆的 JSONB key ──────────────────────────
+        _dbg = conn.execute("SELECT core_fields FROM artifacts LIMIT 1").fetchone()
+        if _dbg and _dbg[0]:
+            with st.expander("🔧 Debug：第一筆 JSONB key（確認後可關閉）"):
+                st.write("**Key 清單（前20個）：**", list(_dbg[0].keys())[:20])
+                st.write("**前3個 key-value：**", {k: v for k, v in list(_dbg[0].items())[:3]})
+        # ── end debug ─────────────────────────────────────────────────────
         col1, col2, col3, col4 = st.columns(4)
 
         cond_counts = dict(conn.execute(
