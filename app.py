@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from db import init_db, get_conn
-from importer_main import preview_import, run_import
+from importer_main import preview_import, run_import, update_artifact
 from importer_supplement import (
     preview_supplement, validate_supplement,
     run_supplement, get_supplement_field_defs,
@@ -496,26 +496,78 @@ elif page == "🔍 搜尋與篩選":
 
         st.dataframe(df_results, use_container_width=True, hide_index=True)
 
-        # 點擊詳情（顯示選取筆的全欄位）
+        # 點擊詳情（顯示選取筆的全欄位，支援編輯）
         st.divider()
         selected_id = st.selectbox("查看完整詳情", ["（不選）"] + list(df_results["metadataID"]))
         if selected_id and selected_id != "（不選）":
             row = conn.execute("SELECT core_fields FROM artifacts WHERE metadata_id=?", (selected_id,)).fetchone()
             if row:
                 core = json.loads(row[0])
-                # 補充欄位
                 supp_rows = conn.execute(
-                    "SELECT field_label, field_value FROM supplement_fields WHERE metadata_id=?",
+                    "SELECT field_code, field_label, field_value FROM supplement_fields WHERE metadata_id=?",
                     (selected_id,)
                 ).fetchall()
-                for sl, sv in supp_rows:
-                    core[f"[補充] {sl}"] = sv
 
-                df_detail = pd.DataFrame(
-                    [(k, v) for k, v in core.items() if v and v != "None"],
-                    columns=["欄位", "值"]
-                )
-                st.dataframe(df_detail, use_container_width=True, hide_index=True)
+                edit_key = f"edit_{selected_id}"
+
+                # 儲存成功提示（rerun 後顯示）
+                if st.session_state.pop(f"save_ok_{selected_id}", False):
+                    st.success("✅ 已儲存！")
+
+                hdr_col, btn_col = st.columns([7, 1])
+                hdr_col.caption(f"**{selected_id}**")
+                if not st.session_state.get(edit_key):
+                    if btn_col.button("✏️ 編輯", key=f"open_{selected_id}"):
+                        st.session_state[edit_key] = True
+                        st.rerun()
+
+                if st.session_state.get(edit_key):
+                    # ── 編輯模式 ──────────────────────────────────────────
+                    st.caption("欄位值可直接點擊修改，完成後按「儲存」。")
+
+                    core_rows = [
+                        (k, str(v) if v and str(v) != "None" else "")
+                        for k, v in core.items()
+                        if not k.startswith("_")
+                    ]
+                    df_edit = pd.DataFrame(core_rows, columns=["欄位", "值"])
+                    edited_df = st.data_editor(
+                        df_edit,
+                        column_config={"欄位": st.column_config.TextColumn(disabled=True)},
+                        use_container_width=True,
+                        hide_index=True,
+                        key=f"de_{selected_id}",
+                    )
+
+                    supp_new = {}
+                    if supp_rows:
+                        st.subheader("補充欄位")
+                        for fc, fl, fv in supp_rows:
+                            supp_new[fc] = (fl, st.text_input(
+                                fl, value=str(fv or ""), key=f"se_{selected_id}_{fc}"
+                            ))
+
+                    c_save, c_cancel, _ = st.columns([1, 1, 5])
+                    if c_save.button("💾 儲存", type="primary", key=f"save_{selected_id}"):
+                        new_core = dict(zip(edited_df["欄位"], edited_df["值"]))
+                        update_artifact(selected_id, new_core, supp_new or None)
+                        st.session_state[edit_key] = False
+                        st.session_state[f"save_ok_{selected_id}"] = True
+                        st.rerun()
+                    if c_cancel.button("✖️ 取消", key=f"cancel_{selected_id}"):
+                        st.session_state[edit_key] = False
+                        st.rerun()
+
+                else:
+                    # ── 檢視模式 ──────────────────────────────────────────
+                    all_fields = {k: v for k, v in core.items() if v and str(v) != "None" and not k.startswith("_")}
+                    for _, fl, fv in supp_rows:
+                        all_fields[f"[補充] {fl}"] = fv
+                    df_detail = pd.DataFrame(
+                        list(all_fields.items()),
+                        columns=["欄位", "值"]
+                    )
+                    st.dataframe(df_detail, use_container_width=True, hide_index=True)
     else:
         st.info("沒有符合條件的資料")
 

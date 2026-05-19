@@ -254,3 +254,63 @@ def run_import(
         "skipped": skipped,
         "batch_label": batch_label,
     }
+
+
+def update_artifact(
+    metadata_id: str,
+    core_fields: dict,
+    supp_updates: dict | None = None,
+) -> dict:
+    """
+    更新單筆文物的核心欄位與補充欄位。
+
+    supp_updates: {field_code: (field_label, new_value)}
+    """
+    conn = get_conn()
+    now = datetime.now().isoformat()
+
+    core_json = json.dumps(core_fields, ensure_ascii=False)
+    conn.execute(
+        "UPDATE artifacts SET core_fields=?, imported_at=? WHERE metadata_id=?",
+        (core_json, now, metadata_id),
+    )
+
+    # 重建 tags（keywords / subjectMatter / placeName）
+    conn.execute("DELETE FROM tags WHERE metadata_id=?", (metadata_id,))
+    for field_prefix in TAG_SPLIT_FIELDS:
+        col = next((k for k in core_fields if k.startswith(field_prefix)), None)
+        if col and core_fields.get(col):
+            for tag in _split_tags(str(core_fields[col]), field_prefix):
+                conn.execute(
+                    "INSERT INTO tags (metadata_id, field_code, tag) VALUES (?,?,?)",
+                    (metadata_id, field_prefix, tag),
+                )
+
+    # 重建 FTS 索引
+    fts_vals = {}
+    for fts_col, field_prefix in FTS_FIELD_MAP.items():
+        src = next((k for k in core_fields if k.startswith(field_prefix)), None)
+        fts_vals[fts_col] = str(core_fields[src]).strip() if src and core_fields.get(src) else ""
+
+    conn.execute("DELETE FROM artifacts_fts WHERE metadata_id=?", (metadata_id,))
+    conn.execute(
+        "INSERT INTO artifacts_fts(metadata_id, main_title, abstract, significance, keywords_raw) VALUES(?,?,?,?,?)",
+        (metadata_id, fts_vals.get("main_title", ""), fts_vals.get("abstract", ""),
+         fts_vals.get("significance", ""), fts_vals.get("keywords_raw", "")),
+    )
+
+    # 更新補充欄位
+    if supp_updates:
+        for field_code, (field_label, new_value) in supp_updates.items():
+            conn.execute(
+                """INSERT INTO supplement_fields
+                   (metadata_id, field_code, field_label, field_value, batch_label, imported_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(metadata_id, field_code)
+                   DO UPDATE SET field_value=excluded.field_value, imported_at=excluded.imported_at""",
+                (metadata_id, field_code, field_label, new_value, "手動編輯", now),
+            )
+
+    conn.commit()
+    conn.close()
+    return {"success": True}
