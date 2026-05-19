@@ -9,12 +9,28 @@ import psycopg2
 import psycopg2.extras
 
 
-def _get_url() -> str:
+def _get_conn_kwargs() -> dict:
+    """
+    支援兩種設定方式：
+    1. 單一 URL：secrets["DATABASE_URL"] 或環境變數 DATABASE_URL
+    2. 個別參數：secrets["DB_HOST"] / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+       （密碼含特殊字元時建議用此方式，不需 URL encode）
+    """
     try:
         import streamlit as st
-        return st.secrets["DATABASE_URL"]
+        s = st.secrets
+        if "DB_HOST" in s:
+            return {
+                "host":     s["DB_HOST"],
+                "port":     int(s.get("DB_PORT", 5432)),
+                "dbname":   s.get("DB_NAME", "postgres"),
+                "user":     s.get("DB_USER", "postgres"),
+                "password": s["DB_PASSWORD"],
+            }
+        return {"dsn": s["DATABASE_URL"]}
     except Exception:
-        return os.environ.get("DATABASE_URL", "")
+        url = os.environ.get("DATABASE_URL", "")
+        return {"dsn": url} if url else {}
 
 
 class _ConnWrapper:
@@ -41,13 +57,13 @@ class _ConnWrapper:
 
 
 def get_conn() -> _ConnWrapper:
-    conn = psycopg2.connect(_get_url())
+    conn = psycopg2.connect(**_get_conn_kwargs())
     return _ConnWrapper(conn)
 
 
 def init_db():
     """建立所有資料表（若不存在）"""
-    raw = psycopg2.connect(_get_url())
+    raw = psycopg2.connect(**_get_conn_kwargs())
     cur = raw.cursor()
 
     cur.execute("""
